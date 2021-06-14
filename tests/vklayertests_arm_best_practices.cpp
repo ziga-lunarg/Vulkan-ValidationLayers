@@ -941,6 +941,7 @@ TEST_F(VkArmBestPracticesLayerTest, RedundantRenderPassStore) {
     InitState();
 
     m_errorMonitor->SetDesiredFailureMsg(kPerformanceWarningBit, "UNASSIGNED-BestPractices-RenderPass-redundant-store");
+    m_errorMonitor->SetAllowedFailureMsg("UNASSIGNED-BestPractices-vkCmdEndRenderPass-redundant-attachment-on-tile");
 
     const VkFormat FMT = VK_FORMAT_R8G8B8A8_UNORM;
     const uint32_t WIDTH = 512, HEIGHT = 512;
@@ -1061,6 +1062,9 @@ TEST_F(VkArmBestPracticesLayerTest, RedundantRenderPassClear) {
     graphics_pipeline.InitInfo();
 
     graphics_pipeline.dsl_bindings_[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    graphics_pipeline.cb_attachments_.colorWriteMask = 0xf;
+    graphics_pipeline.cb_ci_.attachmentCount = 1;
+    graphics_pipeline.cb_ci_.pAttachments = &graphics_pipeline.cb_attachments_;
     graphics_pipeline.InitState();
 
     graphics_pipeline.gp_ci_.renderPass = renderpasses[0];
@@ -1143,6 +1147,9 @@ TEST_F(VkArmBestPracticesLayerTest, InefficientRenderPassClear) {
     graphics_pipeline.InitInfo();
 
     graphics_pipeline.dsl_bindings_[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    graphics_pipeline.cb_attachments_.colorWriteMask = 0xf;
+    graphics_pipeline.cb_ci_.attachmentCount = 1;
+    graphics_pipeline.cb_ci_.pAttachments = &graphics_pipeline.cb_attachments_;
     graphics_pipeline.InitState();
 
     graphics_pipeline.gp_ci_.renderPass = renderpasses[0];
@@ -1233,6 +1240,9 @@ TEST_F(VkArmBestPracticesLayerTest, DescriptorTracking) {
     graphics_pipeline.dsl_bindings_[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
     graphics_pipeline.dsl_bindings_[1].binding = 10;
     graphics_pipeline.dsl_bindings_[1].descriptorCount = 4;
+    graphics_pipeline.cb_ci_.attachmentCount = 1;
+    graphics_pipeline.cb_ci_.pAttachments = &graphics_pipeline.cb_attachments_;
+    graphics_pipeline.cb_attachments_.colorWriteMask = 0xf;
     graphics_pipeline.InitState();
 
     graphics_pipeline.gp_ci_.renderPass = renderpasses[0];
@@ -1355,6 +1365,7 @@ TEST_F(VkArmBestPracticesLayerTest, BlitImageLoadOpLoad) {
     m_errorMonitor->SetAllowedFailureMsg("UNASSIGNED-BestPractices-vkBindMemory-small-dedicated-allocation");
     // On tiled renderers, this can also trigger a warning about LOAD_OP_LOAD causing a readback
     m_errorMonitor->SetAllowedFailureMsg("UNASSIGNED-BestPractices-vkCmdBeginRenderPass-attachment-needs-readback");
+    m_errorMonitor->SetAllowedFailureMsg("UNASSIGNED-BestPractices-vkCmdEndRenderPass-redundant-attachment-on-tile");
     m_commandBuffer->begin();
 
     const VkFormat FMT = VK_FORMAT_R8G8B8A8_UNORM;
@@ -1445,4 +1456,120 @@ TEST_F(VkArmBestPracticesLayerTest, BlitImageLoadOpLoad) {
     vk::QueueWaitIdle(m_device->m_queue);
 
     m_errorMonitor->VerifyFound();
+}
+
+TEST_F(VkArmBestPracticesLayerTest, RedundantAttachment) {
+    TEST_DESCRIPTION("Test for redundant renderpasses which consume bandwidth");
+
+    ASSERT_NO_FATAL_FAILURE(InitBestPracticesFramework());
+    InitState();
+    VkFormatProperties formatProps = {};
+    vk::GetPhysicalDeviceFormatProperties(gpu(), VK_FORMAT_D32_SFLOAT_S8_UINT, &formatProps);
+    printf("Optimal Format Props = 0x%x\n", formatProps.optimalTilingFeatures);
+
+    auto ds = CreateImage(VK_FORMAT_D32_SFLOAT_S8_UINT, 64, 64,
+                          VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
+
+    m_clear_via_load_op = true;
+    m_depth_stencil_fmt = VK_FORMAT_D32_SFLOAT_S8_UINT;
+    auto ds_view = ds->targetView(VK_FORMAT_D32_SFLOAT_S8_UINT,
+                                  VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
+    ASSERT_NO_FATAL_FAILURE(InitRenderTarget(1, &ds_view));
+
+    CreatePipelineHelper pipe_all(*this);
+    pipe_all.InitInfo();
+    pipe_all.InitState();
+    pipe_all.cb_attachments_.colorWriteMask = 0xf;
+    pipe_all.ds_ci_ = {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    pipe_all.gp_ci_.pDepthStencilState = &pipe_all.ds_ci_;
+    pipe_all.ds_ci_.depthTestEnable = VK_TRUE;
+    pipe_all.ds_ci_.stencilTestEnable = VK_TRUE;
+    pipe_all.CreateGraphicsPipeline();
+
+    CreatePipelineHelper pipe_color(*this);
+    pipe_color.InitInfo();
+    pipe_color.InitState();
+    pipe_color.cb_attachments_.colorWriteMask = 0xf;
+    pipe_color.ds_ci_ = {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    pipe_color.gp_ci_.pDepthStencilState = &pipe_color.ds_ci_;
+    pipe_color.CreateGraphicsPipeline();
+
+    CreatePipelineHelper pipe_depth(*this);
+    pipe_depth.InitInfo();
+    pipe_depth.InitState();
+    pipe_depth.cb_attachments_.colorWriteMask = 0;
+    pipe_depth.ds_ci_ = {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    pipe_depth.gp_ci_.pDepthStencilState = &pipe_depth.ds_ci_;
+    pipe_depth.ds_ci_.depthTestEnable = VK_TRUE;
+    pipe_depth.CreateGraphicsPipeline();
+
+    CreatePipelineHelper pipe_stencil(*this);
+    pipe_stencil.InitInfo();
+    pipe_stencil.InitState();
+    pipe_stencil.cb_attachments_.colorWriteMask = 0;
+    pipe_stencil.ds_ci_ = {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    pipe_stencil.gp_ci_.pDepthStencilState = &pipe_stencil.ds_ci_;
+    pipe_stencil.ds_ci_.stencilTestEnable = VK_TRUE;
+    pipe_stencil.CreateGraphicsPipeline();
+
+    m_commandBuffer->begin();
+
+    // Nothing is redundant.
+    {
+        m_commandBuffer->BeginRenderPass(m_renderPassBeginInfo);
+        vk::CmdBindPipeline(m_commandBuffer->handle(), VK_PIPELINE_BIND_POINT_GRAPHICS, pipe_all.pipeline_);
+        m_commandBuffer->Draw(1, 1, 0, 0);
+        m_commandBuffer->EndRenderPass();
+        m_errorMonitor->VerifyNotFound();
+    }
+
+    // Only color is redundant.
+    {
+        m_errorMonitor->SetDesiredFailureMsg(VK_DEBUG_REPORT_PERFORMANCE_WARNING_BIT_EXT,
+                                             "UNASSIGNED-BestPractices-vkCmdEndRenderPass-redundant-attachment-on-tile");
+        m_commandBuffer->BeginRenderPass(m_renderPassBeginInfo);
+        vk::CmdBindPipeline(m_commandBuffer->handle(), VK_PIPELINE_BIND_POINT_GRAPHICS, pipe_depth.pipeline_);
+        m_commandBuffer->Draw(1, 1, 0, 0);
+        vk::CmdBindPipeline(m_commandBuffer->handle(), VK_PIPELINE_BIND_POINT_GRAPHICS, pipe_stencil.pipeline_);
+        m_commandBuffer->Draw(1, 1, 0, 0);
+        m_commandBuffer->EndRenderPass();
+        m_errorMonitor->VerifyFound();
+    }
+
+    // Only depth is redundant.
+    {
+        m_errorMonitor->SetDesiredFailureMsg(VK_DEBUG_REPORT_PERFORMANCE_WARNING_BIT_EXT,
+                                             "UNASSIGNED-BestPractices-vkCmdEndRenderPass-redundant-attachment-on-tile");
+        m_commandBuffer->BeginRenderPass(m_renderPassBeginInfo);
+        vk::CmdBindPipeline(m_commandBuffer->handle(), VK_PIPELINE_BIND_POINT_GRAPHICS, pipe_color.pipeline_);
+        m_commandBuffer->Draw(1, 1, 0, 0);
+        vk::CmdBindPipeline(m_commandBuffer->handle(), VK_PIPELINE_BIND_POINT_GRAPHICS, pipe_stencil.pipeline_);
+        m_commandBuffer->Draw(1, 1, 0, 0);
+        m_commandBuffer->EndRenderPass();
+        m_errorMonitor->VerifyFound();
+    }
+
+    // Only stencil is redundant.
+    {
+        m_errorMonitor->SetDesiredFailureMsg(VK_DEBUG_REPORT_PERFORMANCE_WARNING_BIT_EXT,
+                                             "UNASSIGNED-BestPractices-vkCmdEndRenderPass-redundant-attachment-on-tile");
+        m_commandBuffer->BeginRenderPass(m_renderPassBeginInfo);
+
+        // Test that clear attachments counts as an access.
+        VkClearAttachment clear_att = {};
+        VkClearRect clear_rect = {};
+
+        clear_att.colorAttachment = 0;
+        clear_att.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        clear_rect.layerCount = 1;
+        clear_rect.rect = { { 0, 0 }, { 1, 1 } };
+        vk::CmdClearAttachments(m_commandBuffer->handle(), 1, &clear_att, 1, &clear_rect);
+
+        vk::CmdBindPipeline(m_commandBuffer->handle(), VK_PIPELINE_BIND_POINT_GRAPHICS, pipe_depth.pipeline_);
+        m_commandBuffer->Draw(1, 1, 0, 0);
+        m_commandBuffer->EndRenderPass();
+        m_errorMonitor->VerifyFound();
+    }
+
+    m_commandBuffer->end();
 }

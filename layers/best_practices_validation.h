@@ -135,8 +135,6 @@ class BestPractices : public ValidationStateTracker {
 
     void RecordCmdDrawType(VkCommandBuffer cmd_buffer, uint32_t draw_count, const char* caller);
 
-    void RecordCmdDrawTypeArm(VkCommandBuffer cmd_buffer, uint32_t draw_count, const char* caller);
-
     bool ValidateDeprecatedExtensions(const char* api_name, const char* extension_name, uint32_t version, const char* vuid) const;
 
     bool ValidateSpecialUseExtensions(const char* api_name, const char* extension_name, const char* vuid) const;
@@ -210,6 +208,7 @@ class BestPractices : public ValidationStateTracker {
                                                const VkAllocationCallbacks* pAllocator, VkPipeline* pPipelines,
                                                void* pipe_state) const override;
     bool ValidateCreateComputePipelineArm(const VkComputePipelineCreateInfo& createInfo) const;
+    void PreCallRecordDestroyPipeline(VkDevice device, VkPipeline pipeline, const VkAllocationCallbacks *pAllocator) override;
 
     bool CheckPipelineStageFlags(const std::string& api_name, VkPipelineStageFlags flags) const;
     bool CheckPipelineStageFlags(const std::string& api_name, VkPipelineStageFlags2KHR flags) const;
@@ -253,6 +252,10 @@ class BestPractices : public ValidationStateTracker {
 
     void PreCallRecordCmdBeginRenderPass(VkCommandBuffer commandBuffer, const VkRenderPassBeginInfo* pRenderPassBegin,
                                          VkSubpassContents contents) override;
+    void PreCallRecordCmdBeginRenderPass2(VkCommandBuffer commandBuffer, const VkRenderPassBeginInfo* pRenderPassBegin,
+                                          const VkSubpassBeginInfo *pSubpassBeginInfo) override;
+    void PreCallRecordCmdBeginRenderPass2KHR(VkCommandBuffer commandBuffer, const VkRenderPassBeginInfo* pRenderPassBegin,
+                                             const VkSubpassBeginInfo *pSubpassBeginInfo) override;
     void PreCallRecordCmdEndRenderPass(VkCommandBuffer commandBuffer) override;
     void PreCallRecordCmdEndRenderPass2(VkCommandBuffer commandBuffer, const VkSubpassEndInfo *pSubpassEndInfo) override;
     void PreCallRecordCmdEndRenderPass2KHR(VkCommandBuffer commandBuffer, const VkSubpassEndInfoKHR *pSubpassEndInfo) override;
@@ -294,6 +297,8 @@ class BestPractices : public ValidationStateTracker {
     bool PreCallValidateCmdDispatch(VkCommandBuffer commandBuffer, uint32_t groupCountX, uint32_t groupCountY,
                                     uint32_t groupCountZ) const override;
     bool PreCallValidateCmdEndRenderPass(VkCommandBuffer commandBuffer) const override;
+    bool PreCallValidateCmdEndRenderPass2(VkCommandBuffer commandBuffer, const VkSubpassEndInfo *pSubpassEndInfo) const override;
+    bool PreCallValidateCmdEndRenderPass2KHR(VkCommandBuffer commandBuffer, const VkSubpassEndInfo *pSubpassEndInfo) const override;
     void PreCallRecordCmdDraw(VkCommandBuffer commandBuffer, uint32_t vertexCount, uint32_t instanceCount, uint32_t firstVertex,
                               uint32_t firstInstance) override;
     void PreCallRecordCmdDrawIndirect(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDeviceSize offset, uint32_t drawCount,
@@ -461,6 +466,18 @@ class BestPractices : public ValidationStateTracker {
     void PreCallRecordQueueSubmit(VkQueue queue, uint32_t submitCount, const VkSubmitInfo* pSubmits, VkFence fence) override;
 
     void PreCallRecordBeginCommandBuffer(VkCommandBuffer commandBuffer, const VkCommandBufferBeginInfo *pBeginInfo) override;
+    void PreCallRecordDestroyCommandPool(VkDevice device, VkCommandPool pool, const VkAllocationCallbacks *pAllocation) override;
+    void PreCallRecordFreeCommandBuffers(VkDevice device, VkCommandPool commandPool,
+                                         uint32_t commandBufferCount, const VkCommandBuffer* pCommandBuffers) override;
+
+    void PreCallRecordCmdClearAttachments(VkCommandBuffer commandBuffer, uint32_t attachmentCount,
+                                          const VkClearAttachment* pClearAttachments,
+                                          uint32_t rectCount, const VkClearRect *pRects) override;
+
+    bool PreCallValidateCmdExecuteCommands(VkCommandBuffer commandBuffer, uint32_t commandBufferCount,
+                                           const VkCommandBuffer* pCommandBuffers) const override;
+    void PreCallRecordCmdExecuteCommands(VkCommandBuffer commandBuffer, uint32_t commandBufferCount,
+                                         const VkCommandBuffer* pCommandBuffers) override;
 
 // Include code-generated functions
 #include "best_practices.h"
@@ -494,26 +511,47 @@ class BestPractices : public ValidationStateTracker {
         uint32_t iteration = 0;
     };
 
+    struct AttachmentInfo {
+        uint32_t framebufferAttachment;
+        VkImageAspectFlags aspects;
+    };
+
     struct GraphicsPipelineCIs {
         const safe_VkPipelineDepthStencilStateCreateInfo* depthStencilStateCI;
         const safe_VkPipelineColorBlendStateCreateInfo* colorBlendStateCI;
+        std::vector<AttachmentInfo> accessFramebufferAttachments;
     };
 
     // used to track CreateInfos for graphics pipelines
     layer_data::unordered_map<VkPipeline, GraphicsPipelineCIs> graphicsPipelineCIs = {};
 
-    // used to track state regarding depth pre-pass heuristic checks
-    struct DepthPrePassState {
+    // used to track state regarding render pass heuristic checks
+    struct RenderPassState {
         bool depthAttachment = false;
         bool colorAttachment = false;
         bool depthOnly = false;
         bool depthEqualComparison = false;
         uint32_t numDrawCallsDepthOnly = 0;
         uint32_t numDrawCallsDepthEqualCompare = 0;
+
+        // For secondaries, we need to keep this around for execute commands.
+        struct ClearInfo {
+            uint32_t framebufferAttachment;
+            uint32_t colorAttachment;
+            VkImageAspectFlags aspects;
+            std::vector<VkClearRect> rects;
+        };
+
+        std::vector<ClearInfo> earlyClearAttachments;
+        std::vector<AttachmentInfo> touchesAttachments;
+        std::vector<AttachmentInfo> nextDrawTouchesAttachments;
+        bool drawTouchAttachments = false;
     };
 
-    // used to track depth pre-pass heuristic data per command buffer
-    layer_data::unordered_map<VkCommandBuffer, DepthPrePassState> cbDepthPrePassStates = {};
+    void RecordCmdDrawTypeArm(RenderPassState& render_pass_state, uint32_t draw_count, const char* caller);
+
+    // used to track heuristic data per command buffer
+    layer_data::unordered_map<VkCommandBuffer, RenderPassState> cbRenderPassState = {};
 
     // Used for instance versions of this object
     layer_data::unordered_map<VkSwapchainKHR, SWAPCHAIN_STATE_BP> swapchain_bp_state_map;
@@ -535,6 +573,18 @@ class BestPractices : public ValidationStateTracker {
     void ReleaseImageUsageState(VkImage image);
     std::unordered_map<VkImage, IMAGE_STATE_BP> imageUsageMap;
 
-    QueueCallbacks queue_submit_functions_after_render_pass;
     void AddDeferredQueueOperations(CMD_BUFFER_STATE* cb);
+
+    void RecordAttachmentClearAttachments(CMD_BUFFER_STATE* cmd_state, RenderPassState& state,
+                                          uint32_t fb_attachment, uint32_t color_attachment,
+                                          VkImageAspectFlags aspects,
+                                          uint32_t rectCount, const VkClearRect *pRects);
+    void RecordAttachmentAccess(RenderPassState& state, uint32_t attachment, VkImageAspectFlags aspects);
+    bool ClearAttachmentsIsFullClear(const CMD_BUFFER_STATE* cmd, uint32_t rectCount, const VkClearRect* pRects) const;
+    bool ValidateClearAttachment(VkCommandBuffer commandBuffer, const CMD_BUFFER_STATE* cmd,
+                                 uint32_t fb_attachment, uint32_t color_attachment,
+                                 VkImageAspectFlags aspects, bool secondary) const;
+
+    bool ValidateCmdEndRenderPass(VkCommandBuffer commandBuffer) const;
+    void RecordCmdBeginRenderPass(VkCommandBuffer commandBuffer, const VkRenderPassBeginInfo *pRenderPassBegin);
 };

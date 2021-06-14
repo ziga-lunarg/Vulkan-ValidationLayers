@@ -860,7 +860,10 @@ bool BestPractices::ValidateMultisampledBlendingArm(uint32_t createInfoCount,
         auto rp_state = GetRenderPassState(create_info->renderPass);
         const auto& subpass = rp_state->createInfo.pSubpasses[create_info->subpass];
 
-        for (uint32_t j = 0; j < create_info->pColorBlendState->attachmentCount; j++) {
+        // According to spec, pColorBlendState must be ignored if subpass does not have color attachments.
+        uint32_t num_color_attachments = std::min(subpass.colorAttachmentCount, create_info->pColorBlendState->attachmentCount);
+
+        for (uint32_t j = 0; j < num_color_attachments; j++) {
             const auto& blend_att = create_info->pColorBlendState->pAttachments[j];
             uint32_t att = subpass.pColorAttachments[j].attachment;
 
@@ -933,6 +936,15 @@ bool BestPractices::PreCallValidateCreateGraphicsPipelines(VkDevice device, VkPi
     return skip;
 }
 
+void BestPractices::PreCallRecordDestroyPipeline(VkDevice device, VkPipeline pipeline, const VkAllocationCallbacks *pAllocator)
+{
+    auto itr = graphicsPipelineCIs.find(pipeline);
+    if (itr != graphicsPipelineCIs.end()) {
+        graphicsPipelineCIs.erase(itr);
+    }
+    ValidationStateTracker::PreCallRecordDestroyPipeline(device, pipeline, pAllocator);
+}
+
 void BestPractices::ManualPostCallRecordCreateGraphicsPipelines(VkDevice device, VkPipelineCache pipelineCache, uint32_t count,
                                                                 const VkGraphicsPipelineCreateInfo* pCreateInfos,
                                                                 const VkAllocationCallbacks* pAllocator, VkPipeline* pPipelines,
@@ -942,25 +954,54 @@ void BestPractices::ManualPostCallRecordCreateGraphicsPipelines(VkDevice device,
         const VkPipeline pipeline_handle = pPipelines[i];
 
         // record depth stencil state and color blend states for depth pre-pass tracking purposes
-        auto gp_cis = graphicsPipelineCIs.find(pipeline_handle);
+        GraphicsPipelineCIs& cis = graphicsPipelineCIs[pipeline_handle];
 
-        // add the tracking state if it doesn't exist
-        if (gp_cis == graphicsPipelineCIs.end()) {
-            auto result = graphicsPipelineCIs.emplace(pipeline_handle, GraphicsPipelineCIs{});
+        auto& create_info = cgpl_state->pCreateInfos[i];
 
-            if (!result.second) continue;
+        cis.colorBlendStateCI =
+            create_info.pColorBlendState
+                ? new safe_VkPipelineColorBlendStateCreateInfo(create_info.pColorBlendState)
+                : nullptr;
+        cis.depthStencilStateCI =
+            cgpl_state->pCreateInfos[i].pDepthStencilState
+                ? new safe_VkPipelineDepthStencilStateCreateInfo(create_info.pDepthStencilState)
+                : nullptr;
 
-            gp_cis = result.first;
+        // Record which frame buffer attachments we should consider to be accessed when a draw call is performed.
+        RENDER_PASS_STATE* rp = GetRenderPassState(create_info.renderPass);
+        auto& subpass = rp->createInfo.pSubpasses[create_info.subpass];
+        cis.accessFramebufferAttachments.clear();
+
+        if (cis.colorBlendStateCI) {
+            // According to spec, pColorBlendState must be ignored if subpass does not have color attachments.
+            uint32_t num_color_attachments = std::min(subpass.colorAttachmentCount, cis.colorBlendStateCI->attachmentCount);
+            for (uint32_t j = 0; j < num_color_attachments; j++) {
+                if (cis.colorBlendStateCI->pAttachments[j].colorWriteMask != 0) {
+                    uint32_t attachment = subpass.pColorAttachments[j].attachment;
+                    if (attachment != VK_ATTACHMENT_UNUSED) {
+                        cis.accessFramebufferAttachments.push_back({ attachment, VK_IMAGE_ASPECT_COLOR_BIT });
+                    }
+                }
+            }
         }
 
-        gp_cis->second.colorBlendStateCI =
-            cgpl_state->pCreateInfos[i].pColorBlendState
-                ? new safe_VkPipelineColorBlendStateCreateInfo(cgpl_state->pCreateInfos[i].pColorBlendState)
-                : nullptr;
-        gp_cis->second.depthStencilStateCI =
-            cgpl_state->pCreateInfos[i].pDepthStencilState
-                ? new safe_VkPipelineDepthStencilStateCreateInfo(cgpl_state->pCreateInfos[i].pDepthStencilState)
-                : nullptr;
+        if (cis.depthStencilStateCI && (cis.depthStencilStateCI->depthTestEnable ||
+                                        cis.depthStencilStateCI->depthBoundsTestEnable ||
+                                        cis.depthStencilStateCI->stencilTestEnable)) {
+            uint32_t attachment = subpass.pDepthStencilAttachment ?
+                                  subpass.pDepthStencilAttachment->attachment :
+                                  VK_ATTACHMENT_UNUSED;
+            if (attachment != VK_ATTACHMENT_UNUSED) {
+                VkImageAspectFlags aspects = 0;
+                if (cis.depthStencilStateCI->depthTestEnable || cis.depthStencilStateCI->depthBoundsTestEnable) {
+                    aspects |= VK_IMAGE_ASPECT_DEPTH_BIT;
+                }
+                if (cis.depthStencilStateCI->stencilTestEnable) {
+                    aspects |= VK_IMAGE_ASPECT_STENCIL_BIT;
+                }
+                cis.accessFramebufferAttachments.push_back({ attachment, aspects });
+            }
+        }
     }
 }
 
@@ -1150,6 +1191,42 @@ bool BestPractices::PreCallValidateCreateCommandPool(VkDevice device, const VkCo
     return skip;
 }
 
+void BestPractices::PreCallRecordBeginCommandBuffer(VkCommandBuffer commandBuffer, const VkCommandBufferBeginInfo *pBeginInfo)
+{
+    // Clear state in case we are a secondary command buffer.
+    auto& state = cbRenderPassState[commandBuffer];
+    state = {};
+    auto* cb = GetCBState(commandBuffer);
+    cb->hasDrawCmd = false;
+    ValidationStateTracker::PreCallRecordBeginCommandBuffer(commandBuffer, pBeginInfo);
+}
+
+void BestPractices::PreCallRecordDestroyCommandPool(VkDevice device, VkCommandPool commandPool,
+                                                    const VkAllocationCallbacks *pAllocation)
+{
+    COMMAND_POOL_STATE* pool = GetCommandPoolState(commandPool);
+    if (pool) {
+        for (auto& cb : pool->commandBuffers) {
+            auto itr = cbRenderPassState.find(cb);
+            if (itr != cbRenderPassState.end()) {
+                cbRenderPassState.erase(itr);
+            }
+        }
+    }
+    ValidationStateTracker::PreCallRecordDestroyCommandPool(device, commandPool, pAllocation);
+}
+
+void BestPractices::PreCallRecordFreeCommandBuffers(VkDevice device, VkCommandPool commandPool,
+                                                    uint32_t commandBufferCount, const VkCommandBuffer* pCommandBuffers) {
+    for (uint32_t i = 0; i < commandBufferCount; i++) {
+        auto itr = cbRenderPassState.find(pCommandBuffers[i]);
+        if (itr != cbRenderPassState.end()) {
+            cbRenderPassState.erase(itr);
+        }
+    }
+    ValidationStateTracker::PreCallRecordFreeCommandBuffers(device, commandPool, commandBufferCount, pCommandBuffers);
+}
+
 bool BestPractices::PreCallValidateBeginCommandBuffer(VkCommandBuffer commandBuffer,
                                                       const VkCommandBufferBeginInfo* pBeginInfo) const {
     bool skip = false;
@@ -1271,47 +1348,53 @@ void BestPractices::PostCallRecordCmdBindPipeline(VkCommandBuffer commandBuffer,
         // check for depth/blend state tracking
         auto gp_cis = graphicsPipelineCIs.find(pipeline);
         if (gp_cis != graphicsPipelineCIs.end()) {
-            auto prepass_state = cbDepthPrePassStates.find(commandBuffer);
-            if (prepass_state == cbDepthPrePassStates.end()) {
-                auto result = cbDepthPrePassStates.emplace(commandBuffer, DepthPrePassState{});
+            auto& render_pass_state = cbRenderPassState[commandBuffer];
 
-                if (!result.second) return;
-
-                prepass_state = result.first;
-            }
+            render_pass_state.nextDrawTouchesAttachments = gp_cis->second.accessFramebufferAttachments;
+            render_pass_state.drawTouchAttachments = true;
 
             const auto* blend_state = gp_cis->second.colorBlendStateCI;
             const auto* stencil_state = gp_cis->second.depthStencilStateCI;
 
             if (blend_state) {
                 // assume the pipeline is depth-only unless any of the attachments have color writes enabled
-                prepass_state->second.depthOnly = true;
+                render_pass_state.depthOnly = true;
                 for (size_t i = 0; i < blend_state->attachmentCount; i++) {
                     if (blend_state->pAttachments[i].colorWriteMask != 0) {
-                        prepass_state->second.depthOnly = false;
+                        render_pass_state.depthOnly = false;
                     }
                 }
             }
 
             // check for depth value usage
-            prepass_state->second.depthEqualComparison = false;
+            render_pass_state.depthEqualComparison = false;
 
             if (stencil_state && stencil_state->depthTestEnable) {
                 switch (stencil_state->depthCompareOp) {
                     case VK_COMPARE_OP_EQUAL:
                     case VK_COMPARE_OP_GREATER_OR_EQUAL:
                     case VK_COMPARE_OP_LESS_OR_EQUAL:
-                        prepass_state->second.depthEqualComparison = true;
+                        render_pass_state.depthEqualComparison = true;
                         break;
                     default:
                         break;
                 }
             }
-        } else {
-            // reset depth pre-pass tracking
-            cbDepthPrePassStates.emplace(commandBuffer, DepthPrePassState{});
         }
     }
+}
+
+static inline bool RenderPassUsesAttachmentAsResolve(const safe_VkRenderPassCreateInfo2& createInfo, uint32_t attachment) {
+    for (uint32_t subpass = 0; subpass < createInfo.subpassCount; subpass++) {
+        const auto& subpass_info = createInfo.pSubpasses[subpass];
+        if (subpass_info.pResolveAttachments) {
+            for (uint32_t i = 0; i < subpass_info.colorAttachmentCount; i++) {
+                if (subpass_info.pResolveAttachments[i].attachment == attachment) return true;
+            }
+        }
+    }
+
+    return false;
 }
 
 static inline bool RenderPassUsesAttachmentOnTile(const safe_VkRenderPassCreateInfo2& createInfo, uint32_t attachment) {
@@ -1377,7 +1460,7 @@ bool BestPractices::ValidateCmdBeginRenderPass(VkCommandBuffer commandBuffer, Re
             const auto& attachment = rp_state->createInfo.pAttachments[att];
 
             bool attachment_has_readback = false;
-            if (!FormatHasStencil(attachment.format) && attachment.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD) {
+            if (!FormatIsStencilOnly(attachment.format) && attachment.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD) {
                 attachment_has_readback = true;
             }
 
@@ -1550,9 +1633,9 @@ void BestPractices::ValidateImageInQueue(const char* function_name, IMAGE_STATE_
 
 void BestPractices::AddDeferredQueueOperations(CMD_BUFFER_STATE* cb) {
     cb->queue_submit_functions.insert(cb->queue_submit_functions.end(),
-                                      queue_submit_functions_after_render_pass.begin(),
-                                      queue_submit_functions_after_render_pass.end());
-    queue_submit_functions_after_render_pass.clear();
+                                      cb->queue_submit_functions_after_render_pass.begin(),
+                                      cb->queue_submit_functions_after_render_pass.end());
+    cb->queue_submit_functions_after_render_pass.clear();
 }
 
 void BestPractices::PreCallRecordCmdEndRenderPass(VkCommandBuffer commandBuffer) {
@@ -1570,9 +1653,28 @@ void BestPractices::PreCallRecordCmdEndRenderPass2KHR(VkCommandBuffer commandBuf
     AddDeferredQueueOperations(GetCBState(commandBuffer));
 }
 
-void BestPractices::PreCallRecordCmdBeginRenderPass(VkCommandBuffer commandBuffer, const VkRenderPassBeginInfo* pRenderPassBegin,
+void BestPractices::PreCallRecordCmdBeginRenderPass(VkCommandBuffer commandBuffer,
+                                                    const VkRenderPassBeginInfo* pRenderPassBegin,
                                                     VkSubpassContents contents) {
     ValidationStateTracker::PreCallRecordCmdBeginRenderPass(commandBuffer, pRenderPassBegin, contents);
+    RecordCmdBeginRenderPass(commandBuffer, pRenderPassBegin);
+}
+
+void BestPractices::PreCallRecordCmdBeginRenderPass2(VkCommandBuffer commandBuffer,
+                                                     const VkRenderPassBeginInfo* pRenderPassBegin,
+                                                     const VkSubpassBeginInfo* pSubpassBeginInfo) {
+    ValidationStateTracker::PreCallRecordCmdBeginRenderPass2(commandBuffer, pRenderPassBegin, pSubpassBeginInfo);
+    RecordCmdBeginRenderPass(commandBuffer, pRenderPassBegin);
+}
+
+void BestPractices::PreCallRecordCmdBeginRenderPass2KHR(VkCommandBuffer commandBuffer,
+                                                        const VkRenderPassBeginInfo* pRenderPassBegin,
+                                                        const VkSubpassBeginInfo* pSubpassBeginInfo) {
+    ValidationStateTracker::PreCallRecordCmdBeginRenderPass2KHR(commandBuffer, pRenderPassBegin, pSubpassBeginInfo);
+    RecordCmdBeginRenderPass(commandBuffer, pRenderPassBegin);
+}
+
+void BestPractices::RecordCmdBeginRenderPass(VkCommandBuffer commandBuffer, const VkRenderPassBeginInfo* pRenderPassBegin) {
 
     if (!pRenderPassBegin) {
         return;
@@ -1645,7 +1747,7 @@ void BestPractices::PreCallRecordCmdBeginRenderPass(VkCommandBuffer commandBuffe
                 image_view = GetImageViewState(framebuffer->createInfo.pAttachments[att]);
             }
 
-            QueueValidateImageView(queue_submit_functions_after_render_pass, "vkCmdEndRenderPass()", image_view, usage);
+            QueueValidateImageView(cb->queue_submit_functions_after_render_pass, "vkCmdEndRenderPass()", image_view, usage);
         }
     }
 }
@@ -1674,28 +1776,28 @@ bool BestPractices::PreCallValidateCmdBeginRenderPass2(VkCommandBuffer commandBu
 
 void BestPractices::RecordCmdBeginRenderPass(VkCommandBuffer commandBuffer, RenderPassCreateVersion rp_version,
                                              const VkRenderPassBeginInfo* pRenderPassBegin) {
-    auto prepass_state = cbDepthPrePassStates.find(commandBuffer);
+    // Reset the renderpass state
+    auto& render_pass_state = cbRenderPassState[commandBuffer];
+    render_pass_state.touchesAttachments.clear();
+    render_pass_state.earlyClearAttachments.clear();
+    render_pass_state.numDrawCallsDepthOnly = 0;
+    render_pass_state.numDrawCallsDepthEqualCompare = 0;
+    render_pass_state.colorAttachment = false;
+    render_pass_state.depthAttachment = false;
+    render_pass_state.drawTouchAttachments = true;
+    // Don't reset state related to pipeline state.
 
-    // add the tracking state if it doesn't exist
-    if (prepass_state == cbDepthPrePassStates.end()) {
-        auto result = cbDepthPrePassStates.emplace(commandBuffer, DepthPrePassState{});
-
-        if (!result.second) return;
-
-        prepass_state = result.first;
-    }
-
-    // reset the renderpass state
-    prepass_state->second = {};
+    auto* cb = GetCBState(commandBuffer);
+    cb->hasDrawCmd = false;
 
     const auto* rp_state = GetRenderPassState(pRenderPassBegin->renderPass);
 
     // track depth / color attachment usage within the renderpass
     for (size_t i = 0; i < rp_state->createInfo.subpassCount; i++) {
         // record if depth/color attachments are in use for this renderpass
-        if (rp_state->createInfo.pSubpasses[i].pDepthStencilAttachment != nullptr) prepass_state->second.depthAttachment = true;
+        if (rp_state->createInfo.pSubpasses[i].pDepthStencilAttachment != nullptr) render_pass_state.depthAttachment = true;
 
-        if (rp_state->createInfo.pSubpasses[i].colorAttachmentCount > 0) prepass_state->second.colorAttachment = true;
+        if (rp_state->createInfo.pSubpasses[i].colorAttachmentCount > 0) render_pass_state.colorAttachment = true;
     }
 }
 
@@ -1758,17 +1860,24 @@ bool BestPractices::ValidateCmdDrawType(VkCommandBuffer cmd_buffer, const char* 
 }
 
 void BestPractices::RecordCmdDrawType(VkCommandBuffer cmd_buffer, uint32_t draw_count, const char* caller) {
+    auto& render_pass_state = cbRenderPassState[cmd_buffer];
     if (VendorCheckEnabled(kBPVendorArm)) {
-        RecordCmdDrawTypeArm(cmd_buffer, draw_count, caller);
+        RecordCmdDrawTypeArm(render_pass_state, draw_count, caller);
+    }
+
+    if (render_pass_state.drawTouchAttachments) {
+        for (auto& touch : render_pass_state.nextDrawTouchesAttachments) {
+            RecordAttachmentAccess(render_pass_state, touch.framebufferAttachment, touch.aspects);
+        }
+        // No need to touch the same attachments over and over.
+        render_pass_state.drawTouchAttachments = false;
     }
 }
 
-void BestPractices::RecordCmdDrawTypeArm(VkCommandBuffer cmd_buffer, uint32_t draw_count, const char* caller) {
-    auto prepass_state = cbDepthPrePassStates.find(cmd_buffer);
-    if (prepass_state != cbDepthPrePassStates.end() && draw_count >= kDepthPrePassMinDrawCountArm) {
-        if (prepass_state->second.depthOnly) prepass_state->second.numDrawCallsDepthOnly++;
-
-        if (prepass_state->second.depthEqualComparison) prepass_state->second.numDrawCallsDepthEqualCompare++;
+void BestPractices::RecordCmdDrawTypeArm(RenderPassState& render_pass_state, uint32_t draw_count, const char* caller) {
+    if (draw_count >= kDepthPrePassMinDrawCountArm) {
+        if (render_pass_state.depthOnly) render_pass_state.numDrawCallsDepthOnly++;
+        if (render_pass_state.depthEqualComparison) render_pass_state.numDrawCallsDepthEqualCompare++;
     }
 }
 
@@ -1983,6 +2092,157 @@ bool BestPractices::ValidateIndexBufferArm(VkCommandBuffer commandBuffer, uint32
     return skip;
 }
 
+bool BestPractices::PreCallValidateCmdExecuteCommands(VkCommandBuffer commandBuffer, uint32_t commandBufferCount,
+                                                      const VkCommandBuffer* pCommandBuffers) const {
+    bool skip = false;
+    const CMD_BUFFER_STATE* primary = GetCBState(commandBuffer);
+    for (uint32_t i = 0; i < commandBufferCount; i++) {
+        auto secondary_itr = cbRenderPassState.find(pCommandBuffers[i]);
+        if (secondary_itr == cbRenderPassState.end()) {
+            continue;
+        }
+        auto& secondary = secondary_itr->second;
+        for (auto& clear : secondary.earlyClearAttachments) {
+            if (ClearAttachmentsIsFullClear(primary, uint32_t(clear.rects.size()), clear.rects.data())) {
+                skip |= ValidateClearAttachment(commandBuffer, primary,
+                                                clear.framebufferAttachment, clear.colorAttachment,
+                                                clear.aspects, true);
+            }
+        }
+    }
+    return skip;
+}
+
+void BestPractices::PreCallRecordCmdExecuteCommands(VkCommandBuffer commandBuffer, uint32_t commandBufferCount,
+                                                    const VkCommandBuffer* pCommandBuffers) {
+    CMD_BUFFER_STATE* primary = GetCBState(commandBuffer);
+    auto& primary_state = cbRenderPassState[commandBuffer];
+
+    for (uint32_t i = 0; i < commandBufferCount; i++) {
+        auto& secondary = cbRenderPassState[pCommandBuffers[i]];
+
+        for (auto& early_clear : secondary.earlyClearAttachments) {
+            if (ClearAttachmentsIsFullClear(primary, uint32_t(early_clear.rects.size()), early_clear.rects.data())) {
+                RecordAttachmentClearAttachments(primary, primary_state, early_clear.framebufferAttachment,
+                                                 early_clear.colorAttachment, early_clear.aspects,
+                                                 uint32_t(early_clear.rects.size()), early_clear.rects.data());
+            } else {
+                RecordAttachmentAccess(primary_state, early_clear.framebufferAttachment,
+                                       early_clear.aspects);
+            }
+        }
+
+        for (auto& touch : secondary.touchesAttachments) {
+            RecordAttachmentAccess(primary_state, touch.framebufferAttachment,
+                                   touch.aspects);
+        }
+
+        primary_state.numDrawCallsDepthEqualCompare += secondary.numDrawCallsDepthEqualCompare;
+        primary_state.numDrawCallsDepthOnly += secondary.numDrawCallsDepthOnly;
+
+        CMD_BUFFER_STATE* second_state = GetCBState(pCommandBuffers[i]);
+        if (second_state->hasDrawCmd) {
+            primary->hasDrawCmd = true;
+        }
+    }
+
+    ValidationStateTracker::PreCallRecordCmdExecuteCommands(commandBuffer, commandBufferCount, pCommandBuffers);
+}
+
+void BestPractices::RecordAttachmentAccess(RenderPassState& state, uint32_t fb_attachment, VkImageAspectFlags aspects) {
+    // Called when we have a partial clear attachment, or a normal draw call which accesses an attachment.
+    auto itr = std::find_if(state.touchesAttachments.begin(), state.touchesAttachments.end(),
+                            [&](const AttachmentInfo& info) {
+                                return info.framebufferAttachment == fb_attachment;
+                            });
+
+    if (itr != state.touchesAttachments.end()) {
+        itr->aspects |= aspects;
+    } else {
+        state.touchesAttachments.push_back({ fb_attachment, aspects });
+    }
+}
+
+void BestPractices::RecordAttachmentClearAttachments(CMD_BUFFER_STATE* cmd_state, RenderPassState& state,
+                                                     uint32_t fb_attachment, uint32_t color_attachment,
+                                                     VkImageAspectFlags aspects, uint32_t rectCount,
+                                                     const VkClearRect *pRects) {
+    // If we observe a full clear before any other access to a frame buffer attachment,
+    // we have candidate for redundant clear attachments.
+    auto itr = std::find_if(state.touchesAttachments.begin(), state.touchesAttachments.end(),
+                            [&](const AttachmentInfo& info) {
+                                return info.framebufferAttachment == fb_attachment;
+                            });
+
+    uint32_t new_aspects = aspects;
+    if (itr != state.touchesAttachments.end()) {
+        new_aspects = aspects & ~itr->aspects;
+        itr->aspects |= aspects;
+    } else {
+        state.touchesAttachments.push_back({ fb_attachment, aspects });
+    }
+
+    if (new_aspects == 0) {
+        return;
+    }
+
+    if (cmd_state->createInfo.level == VK_COMMAND_BUFFER_LEVEL_SECONDARY) {
+        // The first command might be a clear, but might not be the first in the render pass, defer any checks until
+        // CmdExecuteCommands.
+        state.earlyClearAttachments.push_back({ fb_attachment, color_attachment, new_aspects,
+                                                std::vector<VkClearRect>{pRects, pRects + rectCount} });
+    }
+}
+
+void BestPractices::PreCallRecordCmdClearAttachments(VkCommandBuffer commandBuffer,
+                                                     uint32_t attachmentCount, const VkClearAttachment* pClearAttachments,
+                                                     uint32_t rectCount, const VkClearRect* pRects) {
+    CMD_BUFFER_STATE* cmd_state = GetCBState(commandBuffer);
+    RENDER_PASS_STATE* rp_state = cmd_state->activeRenderPass.get();
+    FRAMEBUFFER_STATE* fb_state = cmd_state->activeFramebuffer.get();
+    RenderPassState& tracking_state = cbRenderPassState[commandBuffer];
+    bool is_secondary = cmd_state->createInfo.level == VK_COMMAND_BUFFER_LEVEL_SECONDARY;
+
+    if (rectCount == 0 || !rp_state) {
+        return;
+    }
+
+    if (!is_secondary && !fb_state) {
+        return;
+    }
+
+    // If we have a rect which covers the entire frame buffer, we have a LOAD_OP_CLEAR-like command.
+    bool full_clear = ClearAttachmentsIsFullClear(cmd_state, rectCount, pRects);
+
+    auto& subpass = rp_state->createInfo.pSubpasses[cmd_state->activeSubpass];
+    for (uint32_t i = 0; i < attachmentCount; i++) {
+        auto& attachment = pClearAttachments[i];
+        uint32_t fb_attachment = VK_ATTACHMENT_UNUSED;
+        VkImageAspectFlags aspects = attachment.aspectMask;
+
+        if (aspects & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) {
+            if (subpass.pDepthStencilAttachment) {
+                fb_attachment = subpass.pDepthStencilAttachment->attachment;
+            }
+        } else if (aspects & VK_IMAGE_ASPECT_COLOR_BIT) {
+            fb_attachment = subpass.pColorAttachments[attachment.colorAttachment].attachment;
+        }
+
+        if (fb_attachment != VK_ATTACHMENT_UNUSED) {
+            if (full_clear) {
+                RecordAttachmentClearAttachments(cmd_state, tracking_state,
+                                                 fb_attachment, attachment.colorAttachment, aspects,
+                                                 rectCount, pRects);
+            } else {
+                RecordAttachmentAccess(tracking_state, fb_attachment, aspects);
+            }
+        }
+    }
+
+    ValidationStateTracker::PreCallRecordCmdClearAttachments(commandBuffer, attachmentCount, pClearAttachments,
+                                                             rectCount, pRects);
+}
+
 void BestPractices::PreCallRecordCmdDrawIndexed(VkCommandBuffer commandBuffer, uint32_t indexCount, uint32_t instanceCount,
                                                 uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance) {
     ValidationStateTracker::PreCallRecordCmdDrawIndexed(commandBuffer, indexCount, instanceCount, firstIndex, vertexOffset,
@@ -2138,18 +2398,37 @@ bool BestPractices::PreCallValidateCmdDispatch(VkCommandBuffer commandBuffer, ui
     return skip;
 }
 
+bool BestPractices::PreCallValidateCmdEndRenderPass2(VkCommandBuffer commandBuffer, const VkSubpassEndInfo* pSubpassEndInfo) const {
+    bool skip = false;
+    skip |= StateTracker::PreCallValidateCmdEndRenderPass2(commandBuffer, pSubpassEndInfo);
+    skip |= ValidateCmdEndRenderPass(commandBuffer);
+    return skip;
+}
+
+bool BestPractices::PreCallValidateCmdEndRenderPass2KHR(VkCommandBuffer commandBuffer, const VkSubpassEndInfo* pSubpassEndInfo) const {
+    bool skip = false;
+    skip |= StateTracker::PreCallValidateCmdEndRenderPass2KHR(commandBuffer, pSubpassEndInfo);
+    skip |= ValidateCmdEndRenderPass(commandBuffer);
+    return skip;
+}
+
 bool BestPractices::PreCallValidateCmdEndRenderPass(VkCommandBuffer commandBuffer) const {
     bool skip = false;
-
     skip |= StateTracker::PreCallValidateCmdEndRenderPass(commandBuffer);
+    skip |= ValidateCmdEndRenderPass(commandBuffer);
+    return skip;
+}
 
-    auto prepass_state = cbDepthPrePassStates.find(commandBuffer);
+bool BestPractices::ValidateCmdEndRenderPass(VkCommandBuffer commandBuffer) const {
+    bool skip = false;
 
-    if (prepass_state == cbDepthPrePassStates.end()) return skip;
+    auto render_pass_state = cbRenderPassState.find(commandBuffer);
 
-    bool uses_depth = (prepass_state->second.depthAttachment || prepass_state->second.colorAttachment) &&
-                      prepass_state->second.numDrawCallsDepthEqualCompare >= kDepthPrePassNumDrawCallsArm &&
-                      prepass_state->second.numDrawCallsDepthOnly >= kDepthPrePassNumDrawCallsArm;
+    if (render_pass_state == cbRenderPassState.end()) return skip;
+
+    bool uses_depth = (render_pass_state->second.depthAttachment || render_pass_state->second.colorAttachment) &&
+                      render_pass_state->second.numDrawCallsDepthEqualCompare >= kDepthPrePassNumDrawCallsArm &&
+                      render_pass_state->second.numDrawCallsDepthOnly >= kDepthPrePassNumDrawCallsArm;
     if (uses_depth) {
         skip |= LogPerformanceWarning(
             device, kVUID_BestPractices_EndRenderPass_DepthPrePassUsage,
@@ -2157,6 +2436,73 @@ bool BestPractices::PreCallValidateCmdEndRenderPass(VkCommandBuffer commandBuffe
             "Mali-T620, Forward Pixel Killing (FPK) can already perform automatic hidden surface removal; in which "
             "case, using depth pre-passes for hidden surface removal may worsen performance.",
             VendorSpecificTag(kBPVendorArm));
+    }
+
+    const CMD_BUFFER_STATE* cmd = GetCBState(commandBuffer);
+    RENDER_PASS_STATE* rp = cmd->activeRenderPass.get();
+
+    if (VendorCheckEnabled(kBPVendorArm) && rp) {
+
+        // If we use an attachment on-tile, we should access it in some way. Otherwise,
+        // it is redundant to have it be part of the render pass.
+        // Only consider it redundant if it will actually consume bandwidth, i.e.
+        // LOAD_OP_LOAD is used or STORE_OP_STORE. CLEAR -> DONT_CARE is benign,
+        // as is using pure input attachments.
+        // CLEAR -> STORE might be considered a "useful" thing to do, but
+        // the optimal thing to do is to defer the clear until you're actually
+        // going to render to the image.
+
+        uint32_t num_attachments = rp->createInfo.attachmentCount;
+        for (uint32_t i = 0; i < num_attachments; i++) {
+            if (!RenderPassUsesAttachmentOnTile(rp->createInfo, i) ||
+                RenderPassUsesAttachmentAsResolve(rp->createInfo, i)) {
+                continue;
+            }
+
+            auto& attachment = rp->createInfo.pAttachments[i];
+
+            VkImageAspectFlags bandwidth_aspects = 0;
+
+            if (!FormatIsStencilOnly(attachment.format) &&
+                (attachment.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD ||
+                 attachment.storeOp == VK_ATTACHMENT_STORE_OP_STORE)) {
+                if (FormatHasDepth(attachment.format)) {
+                    bandwidth_aspects |= VK_IMAGE_ASPECT_DEPTH_BIT;
+                } else {
+                    bandwidth_aspects |= VK_IMAGE_ASPECT_COLOR_BIT;
+                }
+            }
+
+            if (FormatHasStencil(attachment.format) &&
+                (attachment.stencilLoadOp == VK_ATTACHMENT_LOAD_OP_LOAD ||
+                 attachment.stencilStoreOp == VK_ATTACHMENT_STORE_OP_STORE)) {
+                bandwidth_aspects |= VK_IMAGE_ASPECT_STENCIL_BIT;
+            }
+
+            if (!bandwidth_aspects) {
+                continue;
+            }
+
+            auto itr = std::find_if(render_pass_state->second.touchesAttachments.begin(),
+                                    render_pass_state->second.touchesAttachments.end(),
+                                    [&](const AttachmentInfo& info) {
+                                        return info.framebufferAttachment == i;
+                                    });
+            uint32_t untouched_aspects = bandwidth_aspects;
+            if (itr != render_pass_state->second.touchesAttachments.end()) {
+                untouched_aspects &= ~itr->aspects;
+            }
+
+            if (untouched_aspects) {
+                skip |= LogPerformanceWarning(
+                    device, kVUID_BestPractices_EndRenderPass_RedundantAttachmentOnTile,
+                    "%s Render pass was ended, but attachment #%u (format: %u, untouched aspects 0x%x) "
+                    "was never accessed by a pipeline or clear command. "
+                    "On tile-based architectures, LOAD_OP_LOAD and STORE_OP_STORE consume bandwidth and should not be part of the render pass "
+                    "if the attachments are not intended to be accessed.",
+                    VendorSpecificTag(kBPVendorArm), i, attachment.format, untouched_aspects);
+            }
+        }
     }
 
     return skip;
@@ -2467,6 +2813,98 @@ void BestPractices::ManualPostCallRecordQueueBindSparse(VkQueue queue, uint32_t 
     }
 }
 
+bool BestPractices::ClearAttachmentsIsFullClear(const CMD_BUFFER_STATE* cmd,
+                                                uint32_t rectCount, const VkClearRect* pRects) const {
+    if (cmd->createInfo.level == VK_COMMAND_BUFFER_LEVEL_SECONDARY) {
+        // We don't know the accurate render area in a secondary,
+        // so assume we clear the entire frame buffer.
+        // This is resolved in CmdExecuteCommands where we can check if the clear is a full clear.
+        return true;
+    }
+
+    // If we have a rect which covers the entire frame buffer, we have a LOAD_OP_CLEAR-like command.
+    for (uint32_t i = 0; i < rectCount; i++) {
+        auto& rect = pRects[i];
+        auto& render_area = cmd->activeRenderPassBeginInfo.renderArea;
+        if (rect.rect.extent.width == render_area.extent.width && rect.rect.extent.height == render_area.extent.height) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool BestPractices::ValidateClearAttachment(VkCommandBuffer commandBuffer, const CMD_BUFFER_STATE* cmd,
+                                            uint32_t fb_attachment, uint32_t color_attachment,
+                                            VkImageAspectFlags aspects, bool secondary) const {
+    const RENDER_PASS_STATE* rp = cmd->activeRenderPass.get();
+    bool skip = false;
+
+    if (!rp || fb_attachment == VK_ATTACHMENT_UNUSED) {
+        return skip;
+    }
+
+    auto rp_itr = cbRenderPassState.find(commandBuffer);
+    if (rp_itr == cbRenderPassState.end()) {
+        return skip;
+    }
+
+    auto attachment_itr = std::find_if(rp_itr->second.touchesAttachments.begin(), rp_itr->second.touchesAttachments.end(),
+                                       [&](const AttachmentInfo& info) {
+                                           return info.framebufferAttachment == fb_attachment;
+                                       });
+
+    // Only report aspects which haven't been touched yet.
+    VkImageAspectFlags new_aspects = aspects;
+    if (attachment_itr != rp_itr->second.touchesAttachments.end()) {
+        new_aspects &= ~attachment_itr->aspects;
+    }
+
+    // Warn if this is issued prior to Draw Cmd and clearing the entire attachment
+    if (!cmd->hasDrawCmd) {
+        skip |= LogPerformanceWarning(
+            commandBuffer, kVUID_BestPractices_DrawState_ClearCmdBeforeDraw,
+            "vkCmdClearAttachments() issued on %s prior to any Draw Cmds in current render pass. It is recommended you "
+            "use RenderPass LOAD_OP_CLEAR on attachments instead.",
+            report_data->FormatHandle(commandBuffer).c_str());
+    }
+
+    if ((new_aspects & VK_IMAGE_ASPECT_COLOR_BIT) &&
+        rp->createInfo.pAttachments[fb_attachment].loadOp == VK_ATTACHMENT_LOAD_OP_LOAD) {
+        skip |= LogPerformanceWarning(
+            device, kVUID_BestPractices_ClearAttachments_ClearAfterLoad,
+            "%svkCmdClearAttachments() issued on %s for color attachment #%u in this subpass, "
+            "but LOAD_OP_LOAD was used. If you need to clear the framebuffer, always use LOAD_OP_CLEAR as "
+            "it is more efficient.",
+            secondary ? "vkCmdExecuteCommands(): " : "",
+            report_data->FormatHandle(commandBuffer).c_str(), color_attachment);
+    }
+
+    if ((new_aspects & VK_IMAGE_ASPECT_DEPTH_BIT) &&
+        rp->createInfo.pAttachments[fb_attachment].loadOp == VK_ATTACHMENT_LOAD_OP_LOAD) {
+        skip |= LogPerformanceWarning(
+            device, kVUID_BestPractices_ClearAttachments_ClearAfterLoad,
+            "%svkCmdClearAttachments() issued on %s for the depth attachment in this subpass, "
+            "but LOAD_OP_LOAD was used. If you need to clear the framebuffer, always use LOAD_OP_CLEAR as "
+            "it is more efficient.",
+            secondary ? "vkCmdExecuteCommands(): " : "",
+            report_data->FormatHandle(commandBuffer).c_str());
+    }
+
+    if ((new_aspects & VK_IMAGE_ASPECT_STENCIL_BIT) &&
+        rp->createInfo.pAttachments[fb_attachment].stencilLoadOp == VK_ATTACHMENT_LOAD_OP_LOAD) {
+        skip |= LogPerformanceWarning(
+            device, kVUID_BestPractices_ClearAttachments_ClearAfterLoad,
+            "%svkCmdClearAttachments() issued on %s for the stencil attachment in this subpass, "
+            "but LOAD_OP_LOAD was used. If you need to clear the framebuffer, always use LOAD_OP_CLEAR as "
+            "it is more efficient.",
+            secondary ? "vkCmdExecuteCommands(): " : "",
+            report_data->FormatHandle(commandBuffer).c_str());
+    }
+
+    return skip;
+}
+
 bool BestPractices::PreCallValidateCmdClearAttachments(VkCommandBuffer commandBuffer, uint32_t attachmentCount,
                                                        const VkClearAttachment* pAttachments, uint32_t rectCount,
                                                        const VkClearRect* pRects) const {
@@ -2474,16 +2912,14 @@ bool BestPractices::PreCallValidateCmdClearAttachments(VkCommandBuffer commandBu
     const CMD_BUFFER_STATE* cb_node = GetCBState(commandBuffer);
     if (!cb_node) return skip;
 
-    // Warn if this is issued prior to Draw Cmd and clearing the entire attachment
-    if (!cb_node->hasDrawCmd && (cb_node->activeRenderPassBeginInfo.renderArea.extent.width == pRects[0].rect.extent.width) &&
-        (cb_node->activeRenderPassBeginInfo.renderArea.extent.height == pRects[0].rect.extent.height)) {
-        // There are times where app needs to use ClearAttachments (generally when reusing a buffer inside of a render pass)
-        // This warning should be made more specific. It'd be best to avoid triggering this test if it's a use that must call
-        // CmdClearAttachments.
-        skip |= LogPerformanceWarning(commandBuffer, kVUID_BestPractices_DrawState_ClearCmdBeforeDraw,
-                                      "vkCmdClearAttachments() issued on %s prior to any Draw Cmds. It is recommended you "
-                                      "use RenderPass LOAD_OP_CLEAR on Attachments prior to any Draw.",
-                                      report_data->FormatHandle(commandBuffer).c_str());
+    if (cb_node->createInfo.level == VK_COMMAND_BUFFER_LEVEL_SECONDARY) {
+        // Defer checks to ExecuteCommands.
+        return skip;
+    }
+
+    // Only care about full clears, partial clears might have legitimate uses.
+    if (!ClearAttachmentsIsFullClear(cb_node, rectCount, pRects)) {
+        return skip;
     }
 
     // Check for uses of ClearAttachments along with LOAD_OP_LOAD,
@@ -2494,50 +2930,21 @@ bool BestPractices::PreCallValidateCmdClearAttachments(VkCommandBuffer commandBu
 
         for (uint32_t i = 0; i < attachmentCount; i++) {
             const auto& attachment = pAttachments[i];
+
             if (attachment.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) {
                 uint32_t color_attachment = attachment.colorAttachment;
                 uint32_t fb_attachment = subpass.pColorAttachments[color_attachment].attachment;
-
-                if (fb_attachment != VK_ATTACHMENT_UNUSED) {
-                    if (rp->createInfo.pAttachments[fb_attachment].loadOp == VK_ATTACHMENT_LOAD_OP_LOAD) {
-                        skip |= LogPerformanceWarning(
-                            device, kVUID_BestPractices_ClearAttachments_ClearAfterLoad,
-                            "vkCmdClearAttachments() issued on %s for color attachment #%u in this subpass, "
-                            "but LOAD_OP_LOAD was used. If you need to clear the framebuffer, always use LOAD_OP_CLEAR as "
-                            "it is more efficient.",
-                            report_data->FormatHandle(commandBuffer).c_str(), color_attachment);
-                    }
-                }
+                skip |= ValidateClearAttachment(commandBuffer, cb_node,
+                                                fb_attachment, color_attachment,
+                                                attachment.aspectMask, false);
             }
 
-            if (subpass.pDepthStencilAttachment && attachment.aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT) {
+            if (subpass.pDepthStencilAttachment &&
+                (attachment.aspectMask & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT))) {
                 uint32_t fb_attachment = subpass.pDepthStencilAttachment->attachment;
-
-                if (fb_attachment != VK_ATTACHMENT_UNUSED) {
-                    if (rp->createInfo.pAttachments[fb_attachment].loadOp == VK_ATTACHMENT_LOAD_OP_LOAD) {
-                        skip |= LogPerformanceWarning(
-                            device, kVUID_BestPractices_ClearAttachments_ClearAfterLoad,
-                            "vkCmdClearAttachments() issued on %s for the depth attachment in this subpass, "
-                            "but LOAD_OP_LOAD was used. If you need to clear the framebuffer, always use LOAD_OP_CLEAR as "
-                            "it is more efficient.",
-                            report_data->FormatHandle(commandBuffer).c_str());
-                    }
-                }
-            }
-
-            if (subpass.pDepthStencilAttachment && attachment.aspectMask & VK_IMAGE_ASPECT_STENCIL_BIT) {
-                uint32_t fb_attachment = subpass.pDepthStencilAttachment->attachment;
-
-                if (fb_attachment != VK_ATTACHMENT_UNUSED) {
-                    if (rp->createInfo.pAttachments[fb_attachment].stencilLoadOp == VK_ATTACHMENT_LOAD_OP_LOAD) {
-                        skip |= LogPerformanceWarning(
-                            device, kVUID_BestPractices_ClearAttachments_ClearAfterLoad,
-                            "vkCmdClearAttachments() issued on %s for the stencil attachment in this subpass, "
-                            "but LOAD_OP_LOAD was used. If you need to clear the framebuffer, always use LOAD_OP_CLEAR as "
-                            "it is more efficient.",
-                            report_data->FormatHandle(commandBuffer).c_str());
-                    }
-                }
+                skip |= ValidateClearAttachment(commandBuffer, cb_node,
+                                                fb_attachment, VK_ATTACHMENT_UNUSED,
+                                                attachment.aspectMask, false);
             }
         }
     }
@@ -3053,10 +3460,4 @@ void BestPractices::PreCallRecordQueueSubmit(VkQueue queue, uint32_t submitCount
             }
         }
     }
-}
-
-void BestPractices::PreCallRecordBeginCommandBuffer(VkCommandBuffer commandBuffer, const VkCommandBufferBeginInfo* pBeginInfo) {
-    ValidationStateTracker::PreCallRecordBeginCommandBuffer(commandBuffer, pBeginInfo);
-    // This should not be required, but guards against buggy applications which do not call EndRenderPass correctly.
-    queue_submit_functions_after_render_pass.clear();
 }
