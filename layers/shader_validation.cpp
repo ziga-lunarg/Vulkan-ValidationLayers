@@ -1747,6 +1747,12 @@ bool CoreChecks::ValidatePipelineShaderStage(VkPipelineShaderStageCreateInfo con
                          report_data->FormatHandle(module->vk_shader_module()).c_str(), string_VkShaderStageFlagBits(pStage->stage));
     }
 
+    if (pStage->stage == VK_SHADER_STAGE_ALL_GRAPHICS || pStage->stage == VK_SHADER_STAGE_ALL) {
+        skip |= LogError(device, "VUID-VkPipelineShaderStageCreateInfo-stage-00706", "%s does not have a valid shader stage.",
+                         report_data->FormatHandle(module->vk_shader_module()).c_str());
+        return true;
+    }
+
     // If specialization-constant values are given and specialization-constant instructions are present in the shader, the
     // specializations should be applied and validated.
     if (pStage->pSpecializationInfo != nullptr && pStage->pSpecializationInfo->mapEntryCount > 0 &&
