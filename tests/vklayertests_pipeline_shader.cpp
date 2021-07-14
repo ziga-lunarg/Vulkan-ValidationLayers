@@ -11081,3 +11081,47 @@ TEST_F(VkLayerTest, SpecializationInvalidSizeZero) {
     pipe.CreateComputePipeline();
     m_errorMonitor->VerifyNotFound();
 }
+
+TEST_F(VkLayerTest, ShaderModuleStage) {
+    TEST_DESCRIPTION("Test using invalid shader stage for shader module.");
+
+    ASSERT_NO_FATAL_FAILURE(Init());
+
+    VkDescriptorSetObj descriptorSet(m_device);
+    descriptorSet.AppendDummy();
+    descriptorSet.CreateVKDescriptorSet(m_commandBuffer);
+
+    VkSubpassDescription subpass = {};
+    subpass.pColorAttachments = nullptr;
+    subpass.colorAttachmentCount = 0;
+
+    VkRenderPassCreateInfo rpci = {};
+    rpci.subpassCount = 1;
+    rpci.pSubpasses = &subpass;
+    rpci.attachmentCount = 2;
+
+    VkAttachmentDescription attach_desc[2] = {};
+    attach_desc[0].format = VK_FORMAT_B8G8R8A8_UNORM;
+    attach_desc[0].samples = VK_SAMPLE_COUNT_1_BIT;
+    attach_desc[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    attach_desc[0].finalLayout = VK_IMAGE_LAYOUT_GENERAL;
+    attach_desc[1].format = VK_FORMAT_B8G8R8A8_UNORM;
+    attach_desc[1].samples = VK_SAMPLE_COUNT_1_BIT;
+    attach_desc[1].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    attach_desc[1].finalLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+    rpci.pAttachments = attach_desc;
+    rpci.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+
+    VkRenderPass renderpass;
+    vk::CreateRenderPass(m_device->device(), &rpci, NULL, &renderpass);
+
+    m_errorMonitor->SetAllowedFailureMsg("VUID-VkPipelineShaderStageCreateInfo-stage-parameter");
+    m_errorMonitor->SetDesiredFailureMsg(kErrorBit, "VUID-VkPipelineShaderStageCreateInfo-stage-00706");
+    m_errorMonitor->SetAllowedFailureMsg("VUID-VkGraphicsPipelineCreateInfo-pStages-00736");
+    VkPipelineObj pipeline(m_device);
+    VkShaderObj vs(m_device, bindStateVertShaderText, VK_SHADER_STAGE_ALL_GRAPHICS, this);
+    pipeline.AddShader(&vs);
+    pipeline.CreateVKPipeline(descriptorSet.GetPipelineLayout(), renderpass);
+    m_errorMonitor->VerifyFound();
+}
