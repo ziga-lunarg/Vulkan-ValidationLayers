@@ -2160,6 +2160,16 @@ bool CoreChecks::PreCallValidateCreateImage(VkDevice device, const VkImageCreate
         }
     }
 
+    if (pCreateInfo->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT && pCreateInfo->flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) {
+        const auto image_stencil_struct = LvlFindInChain<VkImageFormatListCreateInfo>(pCreateInfo->pNext);
+        if (image_stencil_struct == nullptr || image_stencil_struct->viewFormatCount == 0) {
+            skip |= LogError(device, "VUID-VkImageCreateInfo-tiling-02353",
+                             "vkCreateImage: tiling is VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT and flags contain "
+                             "VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT, but pNext chain does not include a VkImageFormatListCreateInfo "
+                             "structure with viewFormatCount greater than 0.");
+        }
+    }
+
     return skip;
 }
 
