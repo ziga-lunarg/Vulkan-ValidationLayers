@@ -14042,6 +14042,26 @@ bool CoreChecks::PreCallValidateCmdSetDiscardRectangleEXT(VkCommandBuffer comman
                      ") is not less than VkPhysicalDeviceDiscardRectanglePropertiesEXT::maxDiscardRectangles (%" PRIu32 ".",
                      firstDiscardRectangle, discardRectangleCount, phys_dev_ext_props.discard_rectangle_props.maxDiscardRectangles);
     }
+
+    for (uint32_t i = 0; i < discardRectangleCount; ++i) {
+        const int64_t x_sum =
+            static_cast<int64_t>(pDiscardRectangles[i].offset.x) + static_cast<int64_t>(pDiscardRectangles[i].extent.width);
+        if (x_sum > std::numeric_limits<int32_t>::max()) {
+            skip |= LogError(commandBuffer, "VUID-vkCmdSetDiscardRectangleEXT-offset-00588",
+                             "vkCmdSetDiscardRectangleEXT(): offset.x + extent.width (=%" PRIi32 " + %" PRIu32 " = %" PRIi64
+                             ") of pDiscardRectangles[%" PRIu32 "] will overflow int32_t.",
+                             pDiscardRectangles[i].offset.x, pDiscardRectangles[i].extent.width, x_sum, i);
+        }
+        const int64_t y_sum =
+            static_cast<int64_t>(pDiscardRectangles[i].offset.y) + static_cast<int64_t>(pDiscardRectangles[i].extent.height);
+        if (y_sum > std::numeric_limits<int32_t>::max()) {
+            skip |= LogError(commandBuffer, "VUID-vkCmdSetDiscardRectangleEXT-offset-00589",
+                             "vkCmdSetDiscardRectangleEXT(): offset.y + extent.height (=%" PRIi32 " + %" PRIu32 " = %" PRIi64
+                             ") of pDiscardRectangles[%" PRIu32 "] will overflow int32_t.",
+                             pDiscardRectangles[i].offset.y, pDiscardRectangles[i].extent.height, y_sum, i);
+        }
+    }
+
     return skip;
 }
 
