@@ -11160,3 +11160,39 @@ TEST_F(VkLayerTest, TestCommandBufferInheritanceWithInvalidDepthFormat) {
 
     m_errorMonitor->VerifyFound();
 }
+
+TEST_F(VkLayerTest, AllocatingWrongDescriptorType) {
+    TEST_DESCRIPTION("Allocate uniform buffer dynamic descriptors from pool containing only uniform buffers");
+    ASSERT_NO_FATAL_FAILURE(Init());
+
+    VkDescriptorPoolSize ds_type_count = {};
+    ds_type_count.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    ds_type_count.descriptorCount = 1;
+
+    VkDescriptorPoolCreateInfo ds_pool_ci = LvlInitStruct<VkDescriptorPoolCreateInfo>();
+    ds_pool_ci.maxSets = 1;
+    ds_pool_ci.poolSizeCount = 1;
+    ds_pool_ci.pPoolSizes = &ds_type_count;
+
+    vk_testing::DescriptorPool ds_pool;
+    ds_pool.init(*m_device, ds_pool_ci);
+
+    VkDescriptorSetLayoutBinding dsl_binding = {};
+    dsl_binding.binding = 0;
+    dsl_binding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+    dsl_binding.descriptorCount = 1;
+    dsl_binding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    dsl_binding.pImmutableSamplers = nullptr;
+
+    const VkDescriptorSetLayoutObj ds_layout(m_device, {dsl_binding});
+
+    VkDescriptorSetAllocateInfo alloc_info = LvlInitStruct<VkDescriptorSetAllocateInfo>();
+    alloc_info.descriptorSetCount = 1;
+    alloc_info.descriptorPool = ds_pool.handle();
+    alloc_info.pSetLayouts = &ds_layout.handle();
+
+    m_errorMonitor->SetDesiredFailureMsg(kErrorBit, "VUID-VkDescriptorSetAllocateInfo-descriptorPool-00307");
+    VkDescriptorSet descriptorSet;
+    vk::AllocateDescriptorSets(m_device->device(), &alloc_info, &descriptorSet);
+    m_errorMonitor->VerifyFound();
+}
