@@ -2380,3 +2380,165 @@ TEST_F(VkPositiveLayerTest, WaitTimelineSemThreadRace) {
     data.Run(*m_commandPool, *m_errorMonitor);
 }
 
+TEST_F(VkPositiveLayerTest, QueueFamilyOwnershipTransferTest) {
+    SetTargetApiVersion(VK_API_VERSION_1_3);
+    ASSERT_NO_FATAL_FAILURE(InitFramework());
+    if (DeviceValidationVersion() < VK_API_VERSION_1_3) {
+        GTEST_SKIP() << "At least Vulkan version 1.3 is required";
+    }
+    if (DeviceExtensionSupported(gpu(), nullptr, VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME)) {
+        m_device_extension_names.push_back(VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME);
+    } else {
+        GTEST_SKIP() << "Synchronization2 not supported";
+    }
+
+    if (!CheckSynchronization2SupportAndInitState(this)) {
+        GTEST_SKIP() << "Synchronization2 not supported";
+    }
+
+    uint32_t graphics_qfi = m_device->QueueFamilyMatching(VK_QUEUE_GRAPHICS_BIT, 0);
+    uint32_t transfer_qfi = m_device->QueueFamilyMatching(VK_QUEUE_TRANSFER_BIT, VK_QUEUE_GRAPHICS_BIT);
+    if (graphics_qfi == UINT32_MAX || transfer_qfi == UINT32_MAX) {
+        GTEST_SKIP() << "Required queue families not found.";
+    }
+
+    constexpr uint32_t frame_count = 1000;
+    constexpr uint32_t buffer_count = 3;
+    constexpr uint32_t buffer_range = 64;
+
+    VkQueueObj *graphics_queue = m_device->queue_family_queues(graphics_qfi)[0].get();
+    VkQueueObj *transfer_queue = m_device->queue_family_queues(transfer_qfi)[0].get();
+
+    VkCommandPoolObj graphics_pool(m_device, graphics_qfi);
+    VkCommandPoolObj transfer_pool(m_device, transfer_qfi);
+
+    VkCommandBufferObj graphics_acquire_cb[buffer_count] = {
+        {m_device, &graphics_pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, graphics_queue},
+        {m_device, &graphics_pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, graphics_queue},
+        {m_device, &graphics_pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, graphics_queue},
+    };
+    VkCommandBufferObj graphics_release_cb[buffer_count] = {
+        {m_device, &graphics_pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, graphics_queue},
+        {m_device, &graphics_pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, graphics_queue},
+        {m_device, &graphics_pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, graphics_queue},
+    };
+    VkCommandBufferObj transfer_acquire_cb[buffer_count] = {
+        {m_device, &transfer_pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, transfer_queue},
+        {m_device, &transfer_pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, transfer_queue},
+        {m_device, &transfer_pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, transfer_queue},
+    };
+    VkCommandBufferObj transfer_release_cb[buffer_count] = {
+        {m_device, &transfer_pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, transfer_queue},
+        {m_device, &transfer_pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, transfer_queue},
+        {m_device, &transfer_pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, transfer_queue},
+    };
+
+    auto buffer_info =
+        VkBufferObj::create_info(buffer_range * buffer_count, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                                                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    VkBufferObj buffer;
+    buffer.init(*m_device, buffer_info);
+
+    VkBufferMemoryBarrier2 barrier = LvlInitStruct<VkBufferMemoryBarrier2>();
+    barrier.buffer = buffer.handle();
+    barrier.size = buffer_range;
+
+    VkDependencyInfoKHR dependencyInfo = LvlInitStruct<VkDependencyInfoKHR>();
+    dependencyInfo.bufferMemoryBarrierCount = 1;
+    dependencyInfo.pBufferMemoryBarriers = &barrier;
+
+    VkCommandBufferBeginInfo cmd_buffer_begin_info = LvlInitStruct<VkCommandBufferBeginInfo>();
+
+    for (uint32_t i = 0; i < buffer_count; ++i) {
+        barrier.offset = buffer_range * i;
+
+        barrier.srcStageMask = VK_PIPELINE_STAGE_2_NONE;
+        barrier.srcAccessMask = 0;
+        barrier.dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+        barrier.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        barrier.srcQueueFamilyIndex = graphics_qfi;
+        barrier.dstQueueFamilyIndex = transfer_qfi;
+
+        transfer_acquire_cb[i].begin(&cmd_buffer_begin_info);
+        vk::CmdPipelineBarrier2(transfer_acquire_cb[i].handle(), &dependencyInfo);
+        transfer_acquire_cb[i].end();
+
+        barrier.srcStageMask = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT;
+        barrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+        barrier.dstStageMask = VK_PIPELINE_STAGE_2_NONE;
+        barrier.dstAccessMask = 0;
+
+        graphics_release_cb[i].begin(&cmd_buffer_begin_info);
+        vk::CmdPipelineBarrier2(graphics_release_cb[i].handle(), &dependencyInfo);
+        graphics_release_cb[i].end();
+
+        barrier.srcStageMask = VK_PIPELINE_STAGE_2_NONE;
+        barrier.srcAccessMask = 0;
+        barrier.dstStageMask = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT;
+        barrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+        barrier.srcQueueFamilyIndex = transfer_qfi;
+        barrier.dstQueueFamilyIndex = graphics_qfi;
+
+        graphics_acquire_cb[i].begin(&cmd_buffer_begin_info);
+        vk::CmdPipelineBarrier2(graphics_acquire_cb[i].handle(), &dependencyInfo);
+        graphics_acquire_cb[i].end();
+
+        barrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+        barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        barrier.dstStageMask = VK_PIPELINE_STAGE_2_NONE;
+        barrier.dstAccessMask = 0;
+
+        transfer_release_cb[i].begin(&cmd_buffer_begin_info);
+        vk::CmdPipelineBarrier2(transfer_release_cb[i].handle(), &dependencyInfo);
+        transfer_release_cb[i].end();
+    }
+
+    vk_testing::Fence graphics_fences[buffer_count];
+    vk_testing::Fence transfer_fences[buffer_count];
+    VkFenceCreateInfo fenceInfo = LvlInitStruct<VkFenceCreateInfo>();
+    for (uint32_t i = 0; i < buffer_count; ++i) {
+        graphics_fences[i].init(*m_device, fenceInfo);
+        transfer_fences[i].init(*m_device, fenceInfo);
+    }
+
+    uint32_t graphics_index = 0;
+    uint32_t transfer_index = 0;
+
+    auto transfer_frame = [&transfer_queue, &transfer_acquire_cb, &transfer_release_cb, &transfer_fences](uint32_t transfer_index) {
+        transfer_queue->submit(transfer_acquire_cb[transfer_index]);
+        transfer_queue->submit(transfer_release_cb[transfer_index], transfer_fences[transfer_index]);
+    };
+
+    for (uint32_t i = 0; i < buffer_count; ++i) {
+        VkFence graphics_fence_handle = graphics_fences[i].handle();
+        VkFence transfer_fence_handle = transfer_fences[i].handle();
+        vk::ResetFences(device(), 1, &graphics_fence_handle);
+        vk::ResetFences(device(), 1, &transfer_fence_handle);
+
+        graphics_queue->submit(graphics_release_cb[i], graphics_fences[i]);
+    }
+
+    transfer_frame(transfer_index);
+    ++transfer_index;
+
+    for (uint32_t i = 0; i < frame_count; ++i) {
+        VkFence fences[] = {
+            graphics_fences[graphics_index].handle(),
+            transfer_fences[transfer_index].handle(),
+        };
+        const uint32_t fence_count = i > 1 ? 2 : 1;
+        vk::WaitForFences(device(), fence_count, fences, VK_TRUE, kWaitTimeout);
+        vk::ResetFences(device(), fence_count, fences);
+
+        std::thread thread(transfer_frame, transfer_index);
+
+        graphics_queue->submit(graphics_acquire_cb[graphics_index]);
+        graphics_queue->submit(graphics_release_cb[graphics_index], graphics_fences[graphics_index]);
+
+        thread.join();
+
+        graphics_index = (graphics_index == buffer_count - 1) ? 0 : graphics_index + 1;
+        transfer_index = (transfer_index == buffer_count - 1) ? 0 : transfer_index + 1;
+    }
+    vk::DeviceWaitIdle(device());
+}
