@@ -6408,3 +6408,122 @@ TEST_F(VkPositiveLayerTest, ViewportSwizzleNV) {
         CreatePipelineHelper::OneshotTest(*this, break_vp_count, kErrorBit);
     }
 }
+
+TEST_F(VkPositiveLayerTest, ShaderObjects) {
+    AddRequiredExtensions(VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME);
+    AddRequiredExtensions(VK_EXT_SHADER_OBJECT_EXTENSION_NAME);
+
+    ASSERT_NO_FATAL_FAILURE(InitFramework());
+    if (!AreRequiredExtensionsEnabled()) {
+        GTEST_SKIP() << RequiredExtensionsNotSupported() << " not supported";
+    }
+
+    auto dynamic_rendering_features = LvlInitStruct<VkPhysicalDeviceDynamicRenderingFeaturesKHR>();
+    auto features2 = GetPhysicalDeviceFeatures2(dynamic_rendering_features);
+    if (!dynamic_rendering_features.dynamicRendering) {
+        GTEST_SKIP() << "Test requires (unsupported) " VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME ", skipping\n";
+    }
+
+    ASSERT_NO_FATAL_FAILURE(InitState(nullptr, &features2));
+
+    PFN_vkCmdBindShadersEXT vkCmdBindShadersEXT =
+        reinterpret_cast<PFN_vkCmdBindShadersEXT>(vk::GetDeviceProcAddr(*m_device, "vkCmdBindShadersEXT"));
+    PFN_vkCreateShadersEXT vkCreateShadersEXT =
+        reinterpret_cast<PFN_vkCreateShadersEXT>(vk::GetDeviceProcAddr(*m_device, "vkCreateShadersEXT"));
+    PFN_vkDestroyShaderEXT vkDestroyShaderEXT =
+        reinterpret_cast<PFN_vkDestroyShaderEXT>(vk::GetDeviceProcAddr(*m_device, "vkDestroyShaderEXT"));
+
+    VkImageObj colorImage(m_device);
+    colorImage.Init(32, 32, 1, VK_FORMAT_R8G8B8A8_UINT, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+    VkImageView colorImageView = colorImage.targetView(VK_FORMAT_R8G8B8A8_UINT);
+
+    VkRect2D rect{{0, 0}, {32, 32}};
+    auto color_attachment_info = LvlInitStruct<VkRenderingAttachmentInfoKHR>();
+    color_attachment_info.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    color_attachment_info.imageView = colorImageView;
+    color_attachment_info.imageView = VK_NULL_HANDLE;
+
+    auto begin_rendering_info = LvlInitStruct<VkRenderingInfoKHR>();
+    begin_rendering_info.renderArea = rect;
+    begin_rendering_info.layerCount = 1;
+    begin_rendering_info.colorAttachmentCount = 1;
+    begin_rendering_info.pColorAttachments = &color_attachment_info;
+
+    std::vector<uint32_t> vertSpv;
+    GLSLtoSPV(&m_device->props.limits, VK_SHADER_STAGE_VERTEX_BIT, bindStateVertShaderText, vertSpv);
+    std::vector<uint32_t> fragSpv;
+    GLSLtoSPV(&m_device->props.limits, VK_SHADER_STAGE_FRAGMENT_BIT, bindStateFragShaderText, fragSpv);
+
+    VkShaderCreateInfoEXT createInfos[2];
+    createInfos[0] = LvlInitStruct<VkShaderCreateInfoEXT>();
+    createInfos[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    createInfos[0].codeType = VK_SHADER_CODE_TYPE_SPIRV_EXT;
+    createInfos[0].codeSize = vertSpv.size() * sizeof(uint32_t);
+    createInfos[0].pCode = vertSpv.data();
+    createInfos[0].pName = "main";
+    createInfos[1] = LvlInitStruct<VkShaderCreateInfoEXT>();
+    createInfos[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    createInfos[1].codeType = VK_SHADER_CODE_TYPE_SPIRV_EXT;
+    createInfos[1].codeSize = fragSpv.size() * sizeof(uint32_t);
+    createInfos[1].pCode = fragSpv.data();
+    createInfos[1].pName = "main";
+
+    VkShaderEXT shaders[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    vkCreateShadersEXT(m_device->handle(), 2u, createInfos, nullptr, shaders);
+
+    m_commandBuffer->begin();
+    m_commandBuffer->BeginRendering(begin_rendering_info);
+
+    VkViewport viewport = {
+        0, 0, 32, 32, 0.0f, 1.0f,
+    };
+    vk::CmdSetViewportWithCount(m_commandBuffer->handle(), 1u, &viewport);
+    VkRect2D scissor = {
+        {
+            0,
+            0,
+        },
+        {
+            32,
+            32,
+        },
+    };
+    vk::CmdSetScissorWithCount(m_commandBuffer->handle(), 1u, &scissor);
+    vk::CmdSetLineWidth(m_commandBuffer->handle(), 1.0f);
+    vk::CmdSetDepthBias(m_commandBuffer->handle(), 1.0f, 1.0f, 1.0f);
+    float blendConstants[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    vk::CmdSetBlendConstants(m_commandBuffer->handle(), blendConstants);
+    vk::CmdSetDepthBounds(m_commandBuffer->handle(), 0.0f, 1.0f);
+    vk::CmdSetStencilCompareMask(m_commandBuffer->handle(), VK_STENCIL_FACE_FRONT_AND_BACK, 0xFFFFFFFF);
+    vk::CmdSetStencilWriteMask(m_commandBuffer->handle(), VK_STENCIL_FACE_FRONT_AND_BACK, 0xFFFFFFFF);
+    vk::CmdSetStencilReference(m_commandBuffer->handle(), VK_STENCIL_FACE_FRONT_AND_BACK, 0xFFFFFFFF);
+    vk::CmdBindVertexBuffers2(m_commandBuffer->handle(), 0, 0, nullptr, nullptr, nullptr, nullptr);
+    vk::CmdSetCullMode(m_commandBuffer->handle(), VK_CULL_MODE_NONE);
+    vk::CmdSetDepthBoundsTestEnable(m_commandBuffer->handle(), VK_FALSE);
+    vk::CmdSetDepthCompareOp(m_commandBuffer->handle(), VK_COMPARE_OP_NEVER);
+    vk::CmdSetDepthTestEnable(m_commandBuffer->handle(), VK_FALSE);
+    vk::CmdSetDepthWriteEnable(m_commandBuffer->handle(), VK_FALSE);
+    vk::CmdSetFrontFace(m_commandBuffer->handle(), VK_FRONT_FACE_CLOCKWISE);
+    vk::CmdSetPrimitiveTopology(m_commandBuffer->handle(), VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP);
+    vk::CmdSetStencilOp(m_commandBuffer->handle(), VK_STENCIL_FACE_FRONT_AND_BACK, VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP, VK_COMPARE_OP_NEVER);
+    vk::CmdSetStencilTestEnable(m_commandBuffer->handle(), VK_FALSE);
+    vk::CmdSetDepthBiasEnable(m_commandBuffer->handle(), VK_FALSE);
+    vk::CmdSetPrimitiveRestartEnable(m_commandBuffer->handle(), VK_FALSE);
+    vk::CmdSetRasterizerDiscardEnable(m_commandBuffer->handle(), VK_FALSE);
+
+    VkShaderStageFlagBits stages[2] = {VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT};
+    vkCmdBindShadersEXT(m_commandBuffer->handle(), 2u, stages, shaders);
+    vk::CmdDraw(m_commandBuffer->handle(), 4, 1, 0, 0);
+    m_commandBuffer->EndRendering();
+    m_commandBuffer->end();
+
+    auto submit_info = LvlInitStruct<VkSubmitInfo>();
+    submit_info.commandBufferCount = 1;
+    submit_info.pCommandBuffers = &m_commandBuffer->handle();
+
+    vk::QueueSubmit(m_device->m_queue, 1, &submit_info, VK_NULL_HANDLE);
+    vk::QueueWaitIdle(m_device->m_queue);
+
+    vkDestroyShaderEXT(m_device->handle(), shaders[0], nullptr);
+    vkDestroyShaderEXT(m_device->handle(), shaders[1], nullptr);
+}
