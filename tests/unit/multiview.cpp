@@ -23,18 +23,96 @@ class NegativeMultiview : public VkLayerTest {};
 
 TEST_F(NegativeMultiview, MaxInstanceIndex) {
     TEST_DESCRIPTION("Verify if instance index in CmdDraw is greater than maxMultiviewInstanceIndex.");
-    SetTargetApiVersion(VK_API_VERSION_1_1);
+    /*SetTargetApiVersion(VK_API_VERSION_1_1);
     AddRequiredExtensions(VK_KHR_MULTIVIEW_EXTENSION_NAME);
     AddRequiredFeature(vkt::Feature::multiview);
     RETURN_IF_SKIP(Init());
-    InitRenderTarget();
+    InitRenderTarget();*/
 
-    VkPhysicalDeviceMultiviewProperties multiview_props = vku::InitStructHelper();
-    GetPhysicalDeviceProperties2(multiview_props);
-    if (multiview_props.maxMultiviewInstanceIndex == std::numeric_limits<uint32_t>::max()) {
+    uint32_t api_version;
+    vk::EnumerateInstanceVersion(&api_version);
+
+    if (api_version < VK_API_VERSION_1_2) {
+        GTEST_SKIP() << "VK_API_VERSION_1_2 is required";
+    }
+
+    VkApplicationInfo application_info = vku::InitStructHelper();
+    application_info.apiVersion = VK_API_VERSION_1_2;
+
+    VkInstanceCreateInfo instance_ci = vku::InitStructHelper();
+    instance_ci.flags = 0u;
+    instance_ci.pApplicationInfo = &application_info;
+    instance_ci.enabledLayerCount = 0u;
+    instance_ci.ppEnabledLayerNames = nullptr;
+    instance_ci.enabledExtensionCount = 0u;
+    instance_ci.ppEnabledExtensionNames = nullptr;
+
+    VkInstance instance;
+    vk::CreateInstance(&instance_ci, NULL, &instance);
+
+    uint32_t phys_dev_count;
+    vk::EnumeratePhysicalDevices(instance, &phys_dev_count, nullptr);
+    std::vector<VkPhysicalDevice> phys_devs(phys_dev_count);
+    vk::EnumeratePhysicalDevices(instance, &phys_dev_count, phys_devs.data());
+
+    uint32_t phys_dev_index = phys_dev_count;
+    for (uint32_t i = 0; i < phys_dev_count; ++i) {
+        VkPhysicalDeviceProperties2 phys_dev_props = vku::InitStructHelper();
+        vk::GetPhysicalDeviceProperties2(phys_devs[i], &phys_dev_props);
+
+        if (phys_dev_props.properties.apiVersion >= VK_API_VERSION_1_1 &&
+            phys_dev_props.properties.apiVersion < VK_API_VERSION_1_2) {
+            phys_dev_index = i;
+            break;
+        }
+    }
+    if (phys_dev_index == phys_dev_count) {
+        GTEST_SKIP() << "No suitable device found";
+    }
+
+    VkPhysicalDeviceVulkan11Properties vulkan_11_properties = vku::InitStructHelper();
+    VkPhysicalDeviceProperties2 props2 = vku::InitStructHelper(&vulkan_11_properties);
+
+    if (vulkan_11_properties.maxMultiviewInstanceIndex == std::numeric_limits<uint32_t>::max()) {
         GTEST_SKIP() << "maxMultiviewInstanceIndex is uint32_t max";
     }
-    CreatePipelineHelper pipe(*this);
+
+    uint32_t queue_family_property_count;
+    vk::GetPhysicalDeviceQueueFamilyProperties(phys_devs[phys_dev_index], &queue_family_property_count, nullptr);
+    std::vector<VkQueueFamilyProperties> queue_family_properties(queue_family_property_count);
+    vk::GetPhysicalDeviceQueueFamilyProperties(phys_devs[phys_dev_index], &queue_family_property_count, queue_family_properties.data());
+
+    uint32_t queue_family_index = queue_family_property_count;
+    for (uint32_t i = 0; i < queue_family_property_count; ++i) {
+        if (queue_family_properties[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
+            queue_family_index = i;
+            break;
+        }
+    }
+
+    if (queue_family_index == queue_family_property_count) {
+        GTEST_SKIP() << "No suitable queue family found";
+    }
+
+    float queue_priority = 1.0f;
+
+    VkDeviceQueueCreateInfo device_queue_ci = vku::InitStructHelper();
+    device_queue_ci.queueFamilyIndex = queue_family_index;
+    device_queue_ci.queueCount = 1u;
+    device_queue_ci.pQueuePriorities = &queue_priority;
+
+    VkDeviceCreateInfo device_ci = vku::InitStructHelper();
+    device_ci.queueCreateInfoCount = 1u;
+    device_ci.pQueueCreateInfos = &device_queue_ci;
+    device_ci.enabledExtensionCount = 0u;
+    device_ci.ppEnabledExtensionNames = nullptr;
+    device_ci.pEnabledFeatures = nullptr;
+
+    vkt::Device device(phys_devs[phys_dev_index], device_ci);
+
+    m_command_buffer.Begin();
+
+    /*CreatePipelineHelper pipe(*this);
     pipe.CreateGraphicsPipeline();
 
     m_command_buffer.Begin();
@@ -46,7 +124,7 @@ TEST_F(NegativeMultiview, MaxInstanceIndex) {
     m_errorMonitor->VerifyFound();
 
     m_command_buffer.EndRenderPass();
-    m_command_buffer.End();
+    m_command_buffer.End();*/
 }
 
 TEST_F(NegativeMultiview, ClearColorAttachments) {

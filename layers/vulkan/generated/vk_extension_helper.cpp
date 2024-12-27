@@ -604,6 +604,9 @@ APIVersion DeviceExtensions::InitFromDeviceCreateInfo(const InstanceExtensions* 
     // Initialize struct data, robust to invalid pCreateInfo
     auto api_version = NormalizeApiVersion(requested_api_version);
     if (!api_version.Valid()) return api_version;
+    
+    auto a = VK_API_VERSION_1_1;
+    if (a) a = a;
 
     const auto promotion_info_map = GetDevicePromotionInfoMap();
     for (const auto& version_it : promotion_info_map) {
@@ -617,6 +620,10 @@ APIVersion DeviceExtensions::InitFromDeviceCreateInfo(const InstanceExtensions* 
             }
         }
     }
+
+    const std::array str_enabled = {"kNotEnabled", "kEnabledByCreateinfo", "kEnabledByApiLevel", "kEnabledByInteraction"};
+    printf("this->vk_feature_version_1_2: %s requested_api_version %d api_version %d\n", str_enabled[this->vk_feature_version_1_2],
+           requested_api_version.Value(), api_version.Value());
 
     // CreateInfo takes precedence over promoted
     if (pCreateInfo && pCreateInfo->ppEnabledExtensionNames) {
